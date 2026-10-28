@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Carpool Admin & Incident Desk</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 text-slate-800">
+
+  <!-- Top Navbar -->
+  <header class="bg-slate-900 text-white px-6 py-4 flex justify-between items-center shadow-md">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">🚗</span>
+      <h1 class="text-xl font-bold tracking-wide">Carpool Command & Incident Desk</h1>
+    </div>
+    <div class="flex items-center gap-4">
+      <input id="adminToken" type="password" placeholder="Enter Admin JWT Token" class="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs text-white focus:outline-none w-64" />
+      <button onclick="loadDashboard()" class="bg-blue-600 hover:bg-blue-700 px-4 py-1.5 rounded text-xs font-semibold">Connect</button>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-6 space-y-6">
+
+    <!-- Metrics Strip -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+        <p class="text-xs font-bold text-slate-500 uppercase">Total Users</p>
+        <p id="statUsers" class="text-2xl font-extrabold text-slate-900 mt-1">--</p>
+      </div>
+      <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+        <p class="text-xs font-bold text-slate-500 uppercase">Pending Verifications</p>
+        <p id="statPending" class="text-2xl font-extrabold text-amber-600 mt-1">--</p>
+      </div>
+      <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+        <p class="text-xs font-bold text-slate-500 uppercase">Active / Live Rides</p>
+        <p id="statRides" class="text-2xl font-extrabold text-blue-600 mt-1">--</p>
+      </div>
+      <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+        <p class="text-xs font-bold text-slate-500 uppercase">Active SOS Alerts</p>
+        <p id="statSos" class="text-2xl font-extrabold text-red-600 mt-1">--</p>
+      </div>
+    </div>
+
+    <!-- Live SOS Feed Section -->
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-base font-bold text-red-600 flex items-center gap-2">
+          <span>🚨</span> Live Emergency / SOS Feed
+        </h2>
+        <button onclick="fetchSosFeed()" class="text-xs text-blue-600 hover:underline">Refresh</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs border-collapse">
+          <thead>
+            <tr class="bg-slate-50 border-b text-slate-500 font-semibold uppercase">
+              <th class="p-2.5">User</th>
+              <th class="p-2.5">Phone</th>
+              <th class="p-2.5">Route</th>
+              <th class="p-2.5">Coordinates</th>
+              <th class="p-2.5">Status</th>
+              <th class="p-2.5 text-right">Action</th>
+            </tr>
+          </thead>
+          <tbody id="sosTableBody">
+            <tr><td colspan="6" class="text-center p-4 text-slate-400">Token enter karke connect karein...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Pending Document Verification Queue -->
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+          <span>📄</span> Driving License & Govt ID Verification Desk
+        </h2>
+        <button onclick="fetchVerifications()" class="text-xs text-blue-600 hover:underline">Refresh</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs border-collapse">
+          <thead>
+            <tr class="bg-slate-50 border-b text-slate-500 font-semibold uppercase">
+              <th class="p-2.5">Applicant</th>
+              <th class="p-2.5">Doc Type</th>
+              <th class="p-2.5">Masked Number</th>
+              <th class="p-2.5">Document View</th>
+              <th class="p-2.5 text-right">Review Decisions</th>
+            </tr>
+          </thead>
+          <tbody id="docTableBody">
+            <tr><td colspan="5" class="text-center p-4 text-slate-400">Queue empty ya connect nahi hai...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    const API_BASE = 'http://localhost:3000/api';
+
+    function getHeaders() {
+      const token = document.getElementById('adminToken').value.trim();
+      return {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      };
+    }
+
+    async function loadDashboard() {
+      await Promise.all([fetchMetrics(), fetchSosFeed(), fetchVerifications()]);
+    }
+
+    async function fetchMetrics() {
+      try {
+        const res = await fetch(`${API_BASE}/admin/metrics`, { headers: getHeaders() });
+        const data = await res.json();
+        if (res.ok) {
+          document.getElementById('statUsers').innerText = data.metrics.total_users || 0;
+          document.getElementById('statPending').innerText = data.metrics.pending_verifications || 0;
+          document.getElementById('statRides').innerText = data.metrics.active_scheduled_rides || 0;
+          document.getElementById('statSos').innerText = data.metrics.active_sos_alerts || 0;
+        }
+      } catch (e) { console.error(e); }
+    }
+
+    async function fetchSosFeed() {
+      try {
+        const res = await fetch(`${API_BASE}/admin/sos-feed`, { headers: getHeaders() });
+        const data = await res.json();
+        const tbody = document.getElementById('sosTableBody');
+        tbody.innerHTML = '';
+        if (data.incidents && data.incidents.length > 0) {
+          data.incidents.forEach(item => {
+            const isResolved = item.status === 'resolved';
+            tbody.innerHTML += `
+              <tr class="border-b hover:bg-slate-50">
+                <td class="p-2.5 font-bold">${item.user_name}</td>
+                <td class="p-2.5">${item.user_phone || 'N/A'}</td>
+                <td class="p-2.5">${item.origin || 'N/A'} ➔ ${item.destination || 'N/A'}</td>
+                <td class="p-2.5 text-slate-500">${item.last_known_latitude || '-'}, ${item.last_known_longitude || '-'}</td>
+                <td class="p-2.5">
+                  <span class="px-2 py-0.5 rounded font-bold ${isResolved ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}">
+                    ${item.status.toUpperCase()}
+                  </span>
+                </td>
+                <td class="p-2.5 text-right">
+                  ${!isResolved ? `<button onclick="resolveSos('${item.incident_id}')" class="bg-red-600 hover:bg-red-700 text-white px-2.5 py-1 rounded">Mark Resolved</button>` : '<span class="text-slate-400">Closed</span>'}
+                </td>
+              </tr>
+            `;
+          });
+        } else {
+          tbody.innerHTML = '<tr><td colspan="6" class="text-center p-4 text-green-600 font-semibold">Koi active SOS incident nahi hai ✅</td></tr>';
+        }
+      } catch (e) { console.error(e); }
+    }
+
+    async function resolveSos(id) {
+      const notes = prompt('Resolution details darj karein:');
+      if (!notes) return;
+      await fetch(`${API_BASE}/admin/sos/${id}/resolve`, {
+        method: 'PATCH',
+        headers: getHeaders(),
+        body: JSON.stringify({ resolution_notes: notes })
+      });
+      fetchSosFeed();
+      fetchMetrics();
+    }
+
+    async function fetchVerifications() {
+      try {
+        const res = await fetch(`${API_BASE}/admin/verifications/pending`, { headers: getHeaders() });
+        const data = await res.json();
+        const tbody = document.getElementById('docTableBody');
+        tbody.innerHTML = '';
+        if (data.queue && data.queue.length > 0) {
+          data.queue.forEach(item => {
+            tbody.innerHTML += `
+              <tr class="border-b hover:bg-slate-50">
+                <td class="p-2.5">
+                  <p class="font-bold">${item.name}</p>
+                  <p class="text-slate-400 text-[11px]">${item.email}</p>
+                </td>
+                <td class="p-2.5 uppercase font-medium">${item.document_type || 'N/A'}</td>
+                <td class="p-2.5 font-mono">${item.document_number_masked || 'N/A'}</td>
+                <td class="p-2.5">
+                  <a href="http://localhost:3000${item.document_url}" target="_blank" class="text-blue-600 hover:underline">View Uploaded Doc ↗</a>
+                </td>
+                <td class="p-2.5 text-right space-x-2">
+                  <button onclick="reviewDoc('${item.id}', 'verified')" class="bg-green-600 hover:bg-green-700 text-white px-2.5 py-1 rounded">Approve</button>
+                  <button onclick="reviewDoc('${item.id}', 'rejected')" class="bg-slate-700 hover:bg-slate-800 text-white px-2.5 py-1 rounded">Reject</button>
+                </td>
+              </tr>
+            `;
+          });
+        } else {
+          tbody.innerHTML = '<tr><td colspan="5" class="text-center p-4 text-slate-500">Pending verification queue khali hai.</td></tr>';
+        }
+      } catch (e) { console.error(e); }
+    }
+
+    async function reviewDoc(userId, status) {
+      const notes = prompt(`${status === 'verified' ? 'Approval' : 'Rejection'} reason / notes darj karein:`);
+      await fetch(`${API_BASE}/verification/admin/review/${userId}`, {
+        method: 'PATCH',
+        headers: getHeaders(),
+        body: JSON.stringify({ status, notes })
+      });
+      fetchVerifications();
+      fetchMetrics();
+    }
+  </script>
+</body>
+</html>
