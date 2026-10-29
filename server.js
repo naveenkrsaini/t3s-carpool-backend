@@ -195,7 +195,7 @@ server.listen(PORT, '0.0.0.0', () => {
   }
 });
 
-router.get('/api/rides/:ride_id/messages', async (req, res) => {
+app.get('/api/rides/:ride_id/messages', async (req, res) => {
   try {
     const { ride_id } = req.params;
     const { rows } = await db.query(
