@@ -7,7 +7,8 @@ const rateLimit = require('express-rate-limit');
 const allowedOrigins = [
   'http://localhost:8081', // Expo local development
   'http://localhost:3000',
-  'https://yourdomain.com', // Production domain
+  'https://thetimetravellers.in',
+  'https://api.thetimetravellers.in', // Production domain
 ];
 
 const corsOptions = {

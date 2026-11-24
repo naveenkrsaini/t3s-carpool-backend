@@ -92,7 +92,7 @@ router.get('/verifications/pending', verifyToken, requireAdmin, async (req, res)
     const query = `
       SELECT 
         id, name, email, phone, role, document_type, document_number_masked,
-        document_url, verification_status, created_at
+        document_front_url, document_back_url, verification_status, created_at
       FROM users 
       WHERE verification_status = 'pending'
       ORDER BY updated_at ASC;

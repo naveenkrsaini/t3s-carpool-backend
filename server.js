@@ -11,12 +11,13 @@ const db = require('./config/db');
 
 // Middlewares & Services
 const { sanitizeInput } = require('./middlewares/sanitize');
+const { verifyToken } = require('./middlewares/auth');
 const { initCronJobs } = require('./services/cronService');
-const { startRideExpiryCron } = require('./workers/rideExpiryWorker');
 const { helmetMiddleware, corsMiddleware, apiLimiter, authLimiter } = require('./middlewares/security');
 
 // Import Modular Routes
 const authRoutes = require('./routes/auth');
+const locationRoutes = require('./routes/locationRoutes');
 const rideRoutes = require('./routes/rides');
 const bookingRoutes = require('./routes/bookingRoutes');
 const rideLifecycleRoutes = require('./routes/rideLifecycleRoutes');
@@ -32,14 +33,16 @@ const sessionRoutes = require('./routes/sessionRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // 1. Initialize Express and HTTP Server
 const app = express();
 const server = http.createServer(app);
 
-// 2. Socket.io Setup with CORS
+// 2. Socket.io Setup
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
     methods: ['GET', 'POST'],
   },
 });
@@ -51,7 +54,7 @@ try {
   console.log('Chat socket module optional/loaded:', e.message);
 }
 
-// 3. Security & Body Middlewares (Using centralized security module + body parsers)
+// 3. Security & Body Middlewares
 app.use(helmetMiddleware);
 app.use(corsMiddleware);
 
@@ -59,16 +62,16 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 if (typeof sanitizeInput === 'function') {
-  app.use(sanitizeInput); // Incoming request sanitization
+  app.use(sanitizeInput);
 }
 
 // Serve Static Uploads (Documents/Avatars)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Apply General Rate Limiter to all API routes
+// Rate Limiters
 app.use('/api/', apiLimiter);
-
-// Apply Stricter Rate Limiter specifically to Auth & Verification endpoints
+app.use('/api/auth/send-otp', authLimiter);
+app.use('/api/auth/verify-otp', authLimiter);
 app.use('/api/verification/send-otp', authLimiter);
 app.use('/api/verification/verify-otp', authLimiter);
 
@@ -78,6 +81,7 @@ app.use('/api/verification/verify-otp', authLimiter);
 app.use('/auth', authRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/rides', rideRoutes);
+app.use('/locations', locationRoutes);
 app.use('/api/rides', rideRoutes);
 app.use('/api/verification', verificationRoutes);
 app.use('/api/badges', badgeRoutes);
@@ -94,13 +98,35 @@ app.use('/api/plans', planRoutes);
 app.use('/api/reviews', reviewRoutes);
 app.use('/api/admin', adminRoutes);
 
-// Root route
-app.get('/', (req, res) => {
+// Ride Chat History Endpoint
+app.get('/api/rides/:ride_id/messages', verifyToken, async (req, res) => {
+  try {
+    const { ride_id } = req.params;
+    if (!UUID_REGEX.test(ride_id)) {
+      return res.status(400).json({ success: false, error: 'Invalid ride ID format' });
+    }
+
+    const { rows } = await db.query(
+      `SELECT m.id, m.ride_id, m.sender_id, u.name AS sender_name, m.message, m.created_at
+       FROM ride_messages m
+       JOIN users u ON m.sender_id = u.id
+       WHERE m.ride_id = $1
+       ORDER BY m.created_at ASC`,
+      [ride_id]
+    );
+    return res.json({ success: true, messages: rows });
+  } catch (err) {
+    console.error('Fetch chat history error:', err.message);
+    return res.status(500).json({ success: false, error: 'Chat history fetch karne mein samasya aayi' });
+  }
+});
+
+// Root & Health Routes
+app.get('/', (_req, res) => {
   res.send('Carpooling Backend API is running!');
 });
 
-// Health Check Endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'online',
     timestamp: new Date().toISOString(),
@@ -109,25 +135,33 @@ app.get('/health', (req, res) => {
   });
 });
 
-// User Push Token Registration Route
-app.patch('/users/:userId/push-token', async (req, res) => {
+// Authenticated User Push Token Registration Route
+app.patch('/users/:userId/push-token', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
     const { push_token } = req.body;
 
-    if (!push_token) {
-      return res.status(400).json({ error: 'Push token anivarya hai' });
+    if (!UUID_REGEX.test(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid user ID format' });
+    }
+
+    if (req.user.id !== userId) {
+      return res.status(403).json({ success: false, error: 'Unauthorized push token update' });
+    }
+
+    if (!push_token || typeof push_token !== 'string' || !push_token.trim()) {
+      return res.status(400).json({ success: false, error: 'Push token anivarya hai' });
     }
 
     await db.query(
       'UPDATE users SET push_token = $1, updated_at = NOW() WHERE id = $2',
-      [push_token, userId]
+      [push_token.trim(), userId]
     );
 
-    res.json({ success: true, message: 'Push token safalta se update ho gaya' });
+    return res.json({ success: true, message: 'Push token safalta se update ho gaya' });
   } catch (err) {
     console.error('Push token update error:', err.message);
-    res.status(500).json({ error: 'Push token update fail ho gaya' });
+    return res.status(500).json({ success: false, error: 'Push token update fail ho gaya' });
   }
 });
 
@@ -145,9 +179,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('driver_location_update', ({ ride_id, latitude, longitude, heading, speed }) => {
-    if (!ride_id || !latitude || !longitude) return;
+    if (!ride_id || typeof latitude !== 'number' || typeof longitude !== 'number') return;
 
     socket.to(`ride_${ride_id}`).emit('live_location_received', {
+      ride_id,
       latitude,
       longitude,
       heading: heading || 0,
@@ -171,10 +206,11 @@ io.on('connection', (socket) => {
 // ==========================================
 // 6. CENTRAL ERROR HANDLER
 // ==========================================
-app.use((err, req, res, next) => {
+app.use((err, _req, res, _next) => {
   console.error('Unhandled Error:', err.stack);
   const isProduction = process.env.NODE_ENV === 'production';
   res.status(err.status || 500).json({
+    success: false,
     error: isProduction ? 'Internal Server Error' : err.message || 'Internal Server Error',
   });
 });
@@ -185,30 +221,10 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Carpooling Backend Server running on port ${PORT}`);
-  
-  // Start automated background tasks here after server is successfully running
+
   try {
     if (typeof initCronJobs === 'function') initCronJobs();
-    if (typeof startRideExpiryCron === 'function') startRideExpiryCron();
   } catch (err) {
     console.log('Cron job initialization skipped or failed:', err.message);
-  }
-});
-
-app.get('/api/rides/:ride_id/messages', async (req, res) => {
-  try {
-    const { ride_id } = req.params;
-    const { rows } = await db.query(
-      `SELECT m.id, m.ride_id, m.sender_id, u.name as sender_name, m.message, m.created_at 
-       FROM ride_messages m
-       JOIN users u ON m.sender_id = u.id
-       WHERE m.ride_id = $1 
-       ORDER BY m.created_at ASC`,
-      [ride_id]
-    );
-    res.json({ success: true, messages: rows });
-  } catch (err) {
-    console.error('Fetch chat history error:', err.message);
-    res.status(500).json({ error: 'Chat history fetch karne mein samasya aayi' });
   }
 });

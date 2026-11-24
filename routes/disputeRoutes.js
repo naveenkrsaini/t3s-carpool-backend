@@ -3,11 +3,14 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const { verifyToken } = require('../middlewares/auth');
+const { sendPushNotificationToUser } = require('../services/notificationService');
 const { calculateCancellationPenalty } = require('../utils/cancellationPolicy');
 
-// 1. Cancel Booking with Automatic Seat Restitution & Penalty Breakdown
+// 1. Cancel Booking with Automatic Seat Restitution, Penalty Breakdown & Driver Notification
 router.patch('/cancel-booking/:bookingId', verifyToken, async (req, res) => {
   const client = await db.pool.connect();
+  let driverToNotify = null;
+
   try {
     const { bookingId } = req.params;
     const { cancellation_reason } = req.body;
@@ -15,10 +18,10 @@ router.patch('/cancel-booking/:bookingId', verifyToken, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Booking & related Ride row lock
     const bookingQuery = await client.query(
-      `SELECT b.id, b.rider_id, b.ride_id, b.seats_booked, b.booking_status, 
-              b.total_payable_amount, r.departure_time, r.status AS ride_status
+      `SELECT b.id, b.rider_id, b.ride_id, b.seats_booked, b.booking_status,
+              b.total_payable_amount, r.driver_id, r.origin, r.destination,
+              r.departure_time, r.status AS ride_status
        FROM bookings b
        JOIN rides r ON b.ride_id = r.id
        WHERE b.id = $1
@@ -33,7 +36,6 @@ router.patch('/cancel-booking/:bookingId', verifyToken, async (req, res) => {
 
     const booking = bookingQuery.rows[0];
 
-    // Authorization check
     if (booking.rider_id !== userId) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Aap is booking ko cancel karne ke liye authorized nahi hain' });
@@ -49,38 +51,38 @@ router.patch('/cancel-booking/:bookingId', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Active ya completed trip ko cancel nahi kiya ja sakta' });
     }
 
-    // Penalty Calculation
     const penaltyDetails = calculateCancellationPenalty(
       booking.departure_time,
       booking.total_payable_amount,
       'rider'
     );
 
-    // 1. Mark Booking Status Cancelled
     await client.query(
-      `UPDATE bookings 
+      `UPDATE bookings
        SET booking_status = 'cancelled',
            cancellation_reason = $1,
            cancellation_penalty = $2,
-           refund_amount = $3
-       WHERE id = $4`,
+           refund_amount = $3,
+           cancelled_by = $4,
+           cancelled_at = NOW()
+       WHERE id = $5`,
       [
         cancellation_reason || 'Rider dwara cancel kiya gaya',
         penaltyDetails.penaltyAmount,
         penaltyDetails.refundAmount,
+        userId,
         bookingId,
       ]
     );
 
-    // 2. Return seats back to the Ride
     await client.query(
-      `UPDATE rides 
-       SET seats_available = seats_available + $1 
+      `UPDATE rides
+       SET seats_available = seats_available + $1,
+           updated_at = NOW()
        WHERE id = $2`,
       [booking.seats_booked, booking.ride_id]
     );
 
-    // 3. Admin audit log entry
     await client.query(
       `INSERT INTO admin_audit_logs (
         action_type, target_user_id, target_ride_id, notes
@@ -93,6 +95,23 @@ router.patch('/cancel-booking/:bookingId', verifyToken, async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    driverToNotify = {
+      driverId: booking.driver_id,
+      rideId: booking.ride_id,
+      seatsBooked: booking.seats_booked,
+      origin: booking.origin,
+      destination: booking.destination,
+    };
+
+    if (driverToNotify.driverId) {
+      sendPushNotificationToUser(
+        driverToNotify.driverId,
+        'Seat Cancelled by Rider',
+        `${driverToNotify.seatsBooked} seat(s) cancelled for ${driverToNotify.origin} ➔ ${driverToNotify.destination}.`,
+        { ride_id: driverToNotify.rideId, booking_id: bookingId, type: 'BOOKING_CANCELLED' }
+      ).catch((e) => console.error('Driver cancel notification failed:', e.message));
+    }
 
     return res.status(200).json({
       success: true,

@@ -203,45 +203,68 @@ router.post('/send-otp', async (req, res) => {
   }
 });
 
-// --- 2.2 PHONE OTP: VERIFY OTP & QUICK LOGIN / SIGNUP ---
+// File: routes/auth.js -> Replace router.post('/verify-otp', ...)
 router.post('/verify-otp', async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const { phone, otp } = req.body;
-    if (!phone || !otp) {
-      return res.status(400).json({ error: 'Phone aur OTP dono anivarya hain.' });
+    const { phone, otp, firebase_verified } = req.body;
+    const cleanPhone = (phone || '').trim();
+
+    if (!cleanPhone || cleanPhone.length < 10) {
+      return res.status(400).json({ error: 'Kripya valid mobile number enter karein.' });
+    }
+
+    // Support both Firebase Phone Auth (firebase_verified: true) and DB phone_otps verification
+    if (!firebase_verified) {
+      if (!otp) {
+        return res.status(400).json({ error: 'Phone aur OTP dono anivarya hain.' });
+      }
+      const otpRes = await client.query(
+        `SELECT * FROM phone_otps WHERE phone = $1 AND expires_at > NOW()`,
+        [cleanPhone]
+      );
+      if (otpRes.rows.length === 0 || otpRes.rows[0].otp !== otp.toString().trim()) {
+        return res.status(400).json({ error: 'Invalid ya expired OTP hai.' });
+      }
     }
 
     await client.query('BEGIN');
 
-    const otpRes = await client.query(
-      `SELECT * FROM phone_otps WHERE phone = $1 AND expires_at > NOW()`,
-      [phone.trim()]
-    );
-
-    if (otpRes.rows.length === 0 || otpRes.rows[0].otp !== otp.toString().trim()) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Amanaya (Invalid) ya expired OTP hai.' });
-    }
-
-    let userRes = await client.query(`SELECT * FROM users WHERE phone = $1`, [phone.trim()]);
+    let userRes = await client.query(`SELECT * FROM users WHERE phone = $1`, [cleanPhone]);
     let user;
 
     if (userRes.rows.length === 0) {
-      // Auto register phone user with generated username
-      const defaultName = `User_${phone.trim().slice(-4)}`;
+      const defaultName = `User_${cleanPhone.slice(-4)}`;
       const generatedUsername = await generateUniqueUsername('User');
+      // Satisfy NOT NULL constraint on users.password_hash for phone-only signups
+      const nonReusableHash = await bcrypt.hash(`${cleanPhone}_${Date.now()}_${Math.random()}`, 10);
+      const placeholderEmail = `phone_${cleanPhone.replace(/\D/g, '')}_${Date.now()}@t3s.local`;
+
       const newUserRes = await client.query(
-        `INSERT INTO users (name, first_name, username, phone, role, is_verified) 
-         VALUES ($1, $1, $2, $3, 'rider', false) RETURNING *`,
-        [defaultName, generatedUsername, phone.trim()]
+        `INSERT INTO users (
+          name, first_name, username, email, password_hash, phone, role, is_verified
+        )
+        VALUES ($1, $1, $2, $3, $4, $5, 'rider', false)
+        RETURNING *`,
+        [defaultName, generatedUsername, placeholderEmail, nonReusableHash, cleanPhone]
       );
       user = newUserRes.rows[0];
     } else {
       user = userRes.rows[0];
     }
 
-    await client.query(`DELETE FROM phone_otps WHERE phone = $1`, [phone.trim()]);
+    // Security guard: block banned accounts
+    if (user.is_banned) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({
+        error: user.ban_reason || 'Aapka account suspend hai. Support team se contact karein.',
+      });
+    }
+
+    if (!firebase_verified) {
+      await client.query(`DELETE FROM phone_otps WHERE phone = $1`, [cleanPhone]);
+    }
+
     await client.query('COMMIT');
 
     const token = jwt.sign(
@@ -254,14 +277,12 @@ router.post('/verify-otp', async (req, res) => {
     delete user.password;
     delete user.mpin_hash;
 
-    const isMpinSet = !!user.mpin_hash;
-
     return res.status(200).json({
       success: true,
       message: 'Phone login safal raha!',
       token,
       user,
-      is_mpin_set: isMpinSet,
+      is_mpin_set: false,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -564,42 +585,42 @@ router.post('/biometric-login', async (req, res) => {
 });
 
 // --- 13. UPDATE BIOMETRIC & MPIN PREFERENCES (Profile Security) ---
-router.post('/profile/update-security', async (req, res) => {
-  try {
-    const { user_id, mpin, is_biometric_enabled } = req.body;
-    if (!user_id) {
-      return res.status(400).json({ error: 'User ID is required.' });
-    }
+// router.post('/profile/update-security', async (req, res) => {
+//   try {
+//     const { user_id, mpin, is_biometric_enabled } = req.body;
+//     if (!user_id) {
+//       return res.status(400).json({ error: 'User ID is required.' });
+//     }
 
-    let updateQuery = 'UPDATE users SET updated_at = NOW()';
-    let queryParams = [];
-    let paramIndex = 1;
+//     let updateQuery = 'UPDATE users SET updated_at = NOW()';
+//     let queryParams = [];
+//     let paramIndex = 1;
 
-    if (mpin && mpin.length === 6) {
-      const hashedMpin = await bcrypt.hash(mpin.trim(), 10);
-      updateQuery += `, mpin_hash = $${paramIndex++}`;
-      queryParams.push(hashedMpin);
-    }
+//     if (mpin && mpin.length === 6) {
+//       const hashedMpin = await bcrypt.hash(mpin.trim(), 10);
+//       updateQuery += `, mpin_hash = $${paramIndex++}`;
+//       queryParams.push(hashedMpin);
+//     }
 
-    if (typeof is_biometric_enabled === 'boolean') {
-      updateQuery += `, is_biometric_enabled = $${paramIndex++}`;
-      queryParams.push(is_biometric_enabled);
-    }
+//     if (typeof is_biometric_enabled === 'boolean') {
+//       updateQuery += `, is_biometric_enabled = $${paramIndex++}`;
+//       queryParams.push(is_biometric_enabled);
+//     }
 
-    updateQuery += ` WHERE id = $${paramIndex} RETURNING id, is_biometric_enabled`;
-    queryParams.push(user_id);
+//     updateQuery += ` WHERE id = $${paramIndex} RETURNING id, is_biometric_enabled`;
+//     queryParams.push(user_id);
 
-    const result = await db.query(updateQuery, queryParams);
+//     const result = await db.query(updateQuery, queryParams);
 
-    return res.json({
-      success: true,
-      message: 'Security settings updated successfully!',
-      user: result.rows[0],
-    });
-  } catch (err) {
-    console.error('Update security error:', err.message);
-    return res.status(500).json({ error: 'Server Error while updating security settings' });
-  }
-});
+//     return res.json({
+//       success: true,
+//       message: 'Security settings updated successfully!',
+//       user: result.rows[0],
+//     });
+//   } catch (err) {
+//     console.error('Update security error:', err.message);
+//     return res.status(500).json({ error: 'Server Error while updating security settings' });
+//   }
+// });
 
 module.exports = router;

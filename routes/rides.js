@@ -34,88 +34,165 @@ router.get('/', async (req, res) => {
   }
 });
 
-// 1. Calculate Ceiling Preview API (Frontend live estimate)
+// --- 1. CALCULATE CEILING PREVIEW API ---
 router.post('/estimate-ceiling', verifyToken, (req, res) => {
-  const { distance_km, seats_available, toll_charges, vehicle_type, vehicle_category } = req.body;
+  const {
+    distance_km,
+    seats_available,
+    toll_charges,
+    vehicle_type,
+    vehicle_category,
+    fuel_type,
+  } = req.body;
 
   if (!distance_km || !seats_available) {
     return res.status(400).json({ error: 'distance_km aur seats_available anivarya hain' });
   }
 
   const breakdown = calculateLegalCeiling(
-    distance_km, seats_available, toll_charges,
-    vehicle_type, vehicle_category
+    distance_km,
+    seats_available,
+    toll_charges,
+    vehicle_type || 'sedan',
+    vehicle_category || 'car_5_seater',
+    fuel_type || 'petrol'
   );
 
   return res.status(200).json({ success: true, ceiling: breakdown });
 });
 
-// 2. Publish Ride (Merged: Handles Legal Pricing +Timezone Safe + Multi-Vehicle Metadata + Trial Ride Check)
-
-router.post('/', verifyToken, requireDriver, async (req, res) => {
+// --- 2. PUBLISH RIDE (Idempotent / Anti-Duplicate + Audit Trail + Legal Ceiling) ---
+const publishRideHandler = async (req, res) => {
   const client = await db.pool.connect();
   try {
     const driver_id = req.user.id;
+    const idempotencyKey =
+      req.headers['x-idempotency-key'] || req.body?.idempotency_key || null;
 
-    // 💡 1. Check karein ki driver ki pehle se kitni rides bani hain (Trial Ride check)
+    await client.query('BEGIN');
+
+    // Prevent duplicate insert if same idempotency_key arrives on retry
+    if (idempotencyKey) {
+      const existingByKey = await client.query(
+        `SELECT * FROM rides WHERE idempotency_key = $1 AND driver_id = $2 LIMIT 1`,
+        [String(idempotencyKey), driver_id]
+      );
+      if (existingByKey.rows.length > 0) {
+        await client.query('COMMIT');
+        return res.status(200).json({
+          success: true,
+          deduplicated: true,
+          message: 'Ride already published.',
+          ride: existingByKey.rows[0],
+        });
+      }
+    }
+
+    // Trial Ride & Verification check
     const tripCheckRes = await client.query(
-      'SELECT COUNT(*) FROM rides WHERE driver_id = $1',
-      [driver_id]
+      'SELECT COUNT(*) FROM rides WHERE driver_id = $1 AND status != $2',
+      [driver_id, 'cancelled']
     );
     const totalUserRides = parseInt(tripCheckRes.rows[0].count, 10);
 
-    // 💡 2. Driver ka verification status check karein
     const driverVerifyRes = await client.query(
       'SELECT is_verified FROM users WHERE id = $1',
       [driver_id]
     );
     const isUserVerified = driverVerifyRes.rows[0]?.is_verified;
 
-    // 💡 3. Agar verified nahi hai AUR yeh pehli ride bhi nahi hai, tab block karein
     if (!isUserVerified && totalUserRides > 0) {
+      await client.query('ROLLBACK');
       return res.status(403).json({
-        error: 'Driver verification pending. Please complete your ID/DL verification to offer more rides.'
+        error:
+          'Driver verification pending. Please complete your ID/DL verification to offer more rides.',
       });
     }
 
-    // Frontend payload se exact fields destructure kar rahe hain
     const {
-      origin, start_location, destination, end_location, departure_time, 
-      seats_available, total_seats, price_per_seat,
-      distance_km = 10, // Default for testing if frontend doesn't send yet
+      origin,
+      start_location,
+      destination,
+      end_location,
+      departure_time,
+      seats_available,
+      total_seats,
+      price_per_seat,
+      distance_km,
       toll_charges = 0,
-      vehicle_type = 'default', vehicle_category = 'car_5_seater',
+      vehicle_type = 'sedan',
+      fuel_type = 'petrol',
+      vehicle_category = 'car_5_seater',
       luggage_size = 'small',
       is_ac_available = true,
       is_smoking_allowed = false,
-      is_pet_friendly = false, 
-      gender_preference = 'all',
-      category_restriction = 'open'
+      is_pet_friendly = false,
+      gender_preference = 'any',
+      category_restriction = 'open',
     } = req.body;
 
-    // Validation
     const actualOrigin = origin || start_location;
     const actualDestination = destination || end_location;
     const actualSeats = seats_available || total_seats;
 
-    if (!actualOrigin || !actualDestination || !departure_time || !actualSeats || !price_per_seat || !distance_km) {
+    if (!actualOrigin || !actualDestination || !departure_time || !actualSeats || !price_per_seat) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Sabhi anivarya fields fill karein' });
     }
 
     const offeredPrice = parseFloat(price_per_seat);
     const parsedSeats = parseInt(actualSeats, 10);
-    const parsedDistance = parseFloat(distance_km);
+    const parsedDistance = distance_km ? parseFloat(distance_km) : 10;
+    const parsedToll = toll_charges ? parseFloat(toll_charges) : 0;
 
-    // Legal Cost Ceiling Check
-    const ceilingInfo = calculateLegalCeiling(parsedDistance, parsedSeats, toll_charges, vehicle_type, vehicle_category);
+    if (Number.isNaN(offeredPrice) || Number.isNaN(parsedSeats) || parsedSeats < 1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Valid seats aur price_per_seat dein' });
+    }
+
+    // Legal Cost Ceiling Calculation with Dynamic Toll & Fuel Type
+    const ceilingInfo = calculateLegalCeiling(
+      parsedDistance,
+      parsedSeats,
+      parsedToll,
+      vehicle_type,
+      vehicle_category,
+      fuel_type
+    );
+
     if (offeredPrice > ceilingInfo.maxAllowedPricePerSeat) {
+      await client.query('ROLLBACK');
       return res.status(422).json({
         error: `Legal Cost-Recovery Violation: Price ₹${offeredPrice} ceiling limit (₹${ceilingInfo.maxAllowedPricePerSeat}) se zyada hai. Carpooling platform par commercial taxi pricing allowed nahi hai.`,
         max_allowed_price: ceilingInfo.maxAllowedPricePerSeat,
       });
     }
 
-    // Daily Ride Limit (Private vehicle compliance)
+    // Prevent double-click / rapid duplicate ride for same driver, route & departure time
+    const duplicateCheck = await client.query(
+      `SELECT * FROM rides
+       WHERE driver_id = $1
+         AND LOWER(TRIM(origin)) = LOWER(TRIM($2))
+         AND LOWER(TRIM(destination)) = LOWER(TRIM($3))
+         AND status IN ('scheduled', 'in_progress')
+         AND ABS(EXTRACT(EPOCH FROM (departure_time - $4::timestamptz))) <= 120
+         AND created_at >= NOW() - INTERVAL '60 seconds'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [driver_id, actualOrigin, actualDestination, departure_time]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      await client.query('COMMIT');
+      return res.status(200).json({
+        success: true,
+        deduplicated: true,
+        message: 'Duplicate submission prevented; ride already created.',
+        ride: duplicateCheck.rows[0],
+      });
+    }
+
+    // Daily Ride Limit Check
     const tripCountCheck = await client.query(
       `SELECT COUNT(*) FROM rides 
        WHERE driver_id = $1 
@@ -125,36 +202,58 @@ router.post('/', verifyToken, requireDriver, async (req, res) => {
     );
 
     if (parseInt(tripCountCheck.rows[0].count, 10) >= 3) {
+      await client.query('ROLLBACK');
       return res.status(429).json({
-        error: 'Daily trip limit exceeded: Ek din mein adhiktam 3 rides ki anumati hai private vehicle compliance ke liye.',
+        error:
+          'Daily trip limit exceeded: Ek din mein adhiktam 3 rides ki anumati hai private vehicle compliance ke liye.',
       });
     }
 
-    await client.query('BEGIN');
-
-    // Insert into DB 
     const insertQuery = `
       INSERT INTO rides (
-        driver_id, origin, destination, departure_time, seats_available, price_per_seat, 
-        max_price_ceiling, toll_charges,
-        vehicle_category, luggage_size, is_ac_available,
-        is_smoking_allowed, is_pet_friendly, gender_preference, category_restriction, status
-      ) VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'scheduled')
+        driver_id, origin, destination, departure_time, seats_available, price_per_seat,
+        max_price_ceiling, toll_charges, distance_km,
+        vehicle_type, fuel_type, vehicle_category, luggage_size, is_ac_available,
+        is_smoking_allowed, is_pet_friendly, gender_preference, category_restriction,
+        idempotency_key, status
+      ) VALUES (
+        $1, $2, $3, $4::timestamptz, $5, $6,
+        $7, $8, $9,
+        $10, $11, $12, $13, $14,
+        $15, $16, $17, $18,
+        $19, 'scheduled'
+      )
       RETURNING *;
     `;
 
     const result = await client.query(insertQuery, [
-      driver_id, actualOrigin.trim(), actualDestination.trim(), departure_time, parsedSeats, offeredPrice,
-      ceilingInfo.maxAllowedPricePerSeat, toll_charges,
-      vehicle_category, luggage_size, is_ac_available, 
-      is_smoking_allowed, is_pet_friendly, gender_preference, category_restriction,
+      driver_id,
+      actualOrigin.trim(),
+      actualDestination.trim(),
+      departure_time,
+      parsedSeats,
+      offeredPrice,
+      ceilingInfo.maxAllowedPricePerSeat,
+      parsedToll,
+      parsedDistance,
+      vehicle_type,
+      fuel_type,
+      vehicle_category,
+      luggage_size,
+      is_ac_available,
+      is_smoking_allowed,
+      is_pet_friendly,
+      gender_preference,
+      category_restriction,
+      idempotencyKey ? String(idempotencyKey) : null,
     ]);
 
     await client.query('COMMIT');
 
-    const successMessage = totalUserRides === 0 
-      ? '🎉 Trial ride safaltapoorvak create ho gayi!' 
-      : 'Ride safaltapoorvak create ho gayi. Ride successfully published!';
+    const successMessage =
+      totalUserRides === 0
+        ? '🎉 Trial ride safaltapoorvak create ho gayi!'
+        : 'Ride safaltapoorvak create ho gayi. Ride successfully published with audit trail!';
 
     return res.status(201).json({
       success: true,
@@ -162,25 +261,25 @@ router.post('/', verifyToken, requireDriver, async (req, res) => {
       ride: result.rows[0],
       legal_compliance: {
         cost_ceiling: ceilingInfo.maxAllowedPricePerSeat,
+        total_trip_cost: ceilingInfo.totalTripCost,
+        toll_included: parsedToll,
         is_compliant: true,
       },
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Create ride error:', error);
-    return res.status(500).json({ error: 'Server error: Ride publish fail ho gayi. Ride create karte waqt server error aaya' });
+    return res.status(500).json({ error: 'Server error: Ride publish fail ho gayi.' });
   } finally {
     client.release();
   }
-});
+};
 
-// Backward compatibility aliases
-router.post('/offer', verifyToken, requireDriver, (req, res, next) => { req.url = '/'; router.handle(req, res, next);});
-router.post('/create', (req, res, next) => { req.url = '/'; router.handle(req, res, next); });
-router.post('/offer', (req, res, next) => { req.url = '/'; router.handle(req, res, next); });
+router.post('/', verifyToken, requireDriver, publishRideHandler);
+router.post('/offer', verifyToken, requireDriver, publishRideHandler);
+router.post('/create', verifyToken, requireDriver, publishRideHandler);
 
-
-// --- 3. SEARCH RIDES (Timezone-Safe IST Search) ---
+// --- 3. SEARCH RIDES ---
 router.get('/search', async (req, res) => {
   try {
     const { from, to, date, seats, gender, category } = req.query;
@@ -195,19 +294,10 @@ router.get('/search', async (req, res) => {
            WHERE rev.reviewed_user_id = u.id),
           5.0
         ) AS driver_rating,
-        r.origin,
-        r.destination,
-        r.departure_time,
-        r.price_per_seat,
-        r.seats_available,
-        r.seats_available AS available_seats,
-        r.luggage_size,
-        r.is_ac_available,
-        r.is_smoking_allowed,
-        r.is_pet_friendly,
-        r.gender_preference,
-        r.category_restriction,
-        r.status
+        r.origin, r.destination, r.departure_time, r.price_per_seat,
+        r.seats_available, r.seats_available AS available_seats,
+        r.luggage_size, r.is_ac_available, r.is_smoking_allowed,
+        r.is_pet_friendly, r.gender_preference, r.category_restriction, r.status
       FROM rides r
       JOIN users u ON r.driver_id = u.id
       WHERE r.status = 'scheduled'
@@ -216,24 +306,18 @@ router.get('/search', async (req, res) => {
 
     const queryParams = [];
 
-    // if (from) { queryParams.push(`%${from.trim().toLowerCase()}%`); queryText += ` AND LOWER(r.origin) LIKE $${queryParams.length}`; }
-    // if (to) { queryParams.push(`%${to.trim().toLowerCase()}%`); queryText += ` AND LOWER(r.destination) LIKE $${queryParams.length}`; }
-    // if (date) { queryParams.push(date.trim()); queryText += ` AND TO_CHAR(r.departure_time AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') = $${queryParams.length}`; }
-    // if (gender && gender !== 'all') { queryParams.push(gender); queryText += ` AND r.gender_preference IN ('all', $${queryParams.length})`; }
-    // if (category && category !== 'open') { queryParams.push(category); queryText += ` AND r.category_restriction IN ('open', $${queryParams.length})`; }
-
-    if (from && from.trim()) {
-      queryParams.push(`%${from.trim().toLowerCase()}%`);
+    if (from && String(from).trim()) {
+      queryParams.push(`%${String(from).trim().toLowerCase()}%`);
       queryText += ` AND LOWER(r.origin) LIKE $${queryParams.length}`;
     }
 
-    if (to && to.trim()) {
-      queryParams.push(`%${to.trim().toLowerCase()}%`);
+    if (to && String(to).trim()) {
+      queryParams.push(`%${String(to).trim().toLowerCase()}%`);
       queryText += ` AND LOWER(r.destination) LIKE $${queryParams.length}`;
     }
 
-    if (date && date.trim()) {
-      queryParams.push(date.trim());
+    if (date && String(date).trim()) {
+      queryParams.push(String(date).trim());
       queryText += ` AND TO_CHAR(r.departure_time AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') = $${queryParams.length}`;
     }
 
@@ -271,10 +355,7 @@ router.post('/:id/book', verifyToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const rideCheck = await client.query(
-      `SELECT * FROM rides WHERE id = $1 FOR UPDATE`,
-      [rideId]
-    );
+    const rideCheck = await client.query(`SELECT * FROM rides WHERE id = $1 FOR UPDATE`, [rideId]);
 
     if (rideCheck.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -282,6 +363,11 @@ router.post('/:id/book', verifyToken, async (req, res) => {
     }
 
     const ride = rideCheck.rows[0];
+
+    if (String(ride.driver_id) === String(riderId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You cannot book your own ride.' });
+    }
 
     if (ride.status !== 'scheduled') {
       await client.query('ROLLBACK');
@@ -305,13 +391,7 @@ router.post('/:id/book', verifyToken, async (req, res) => {
 
     const bookingResult = await client.query(
       `INSERT INTO bookings (
-        ride_id, 
-        rider_id, 
-        seats_booked, 
-        total_payable_amount, 
-        ride_otp, 
-        booking_status, 
-        payment_status
+        ride_id, rider_id, seats_booked, total_payable_amount, ride_otp, booking_status, payment_status
       ) VALUES ($1, $2, $3, $4, $5, 'confirmed', 'pending')
       RETURNING *`,
       [rideId, riderId, seatsNum, totalFare, rideOtp]
@@ -333,8 +413,7 @@ router.post('/:id/book', verifyToken, async (req, res) => {
   }
 });
 
-
-// --- 6. GET RIDES CREATED BY DRIVER ---
+// --- 5. GET RIDES CREATED BY DRIVER ---
 router.get('/driver/:driverId', verifyToken, async (req, res) => {
   try {
     const { driverId } = req.params;
@@ -368,206 +447,185 @@ router.get('/driver/:driverId', verifyToken, async (req, res) => {
   }
 });
 
-// --- 5. GET RIDER'S BOOKINGS ---
-router.get('/user/:userId/bookings', verifyToken, async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const queryText = `
-      SELECT 
-        b.id AS booking_id,
-        b.seats_booked,
-        b.booking_status,
-        b.payment_status,
-        b.total_payable_amount,
-        b.ride_otp,
-        b.created_at,
-        r.id AS ride_id,
-        r.origin,
-        r.destination,
-        r.departure_time,
-        r.price_per_seat,
-        r.status AS ride_status,
-        u.name AS driver_name,
-        u.phone AS driver_phone
-      FROM bookings b
-      JOIN rides r ON b.ride_id = r.id
-      JOIN users u ON r.driver_id = u.id
-      WHERE b.rider_id = $1
-      ORDER BY r.departure_time DESC
-    `;
-
-    const { rows } = await db.query(queryText, [userId]);
-    return res.status(200).json({ success: true, bookings: rows });
-  } catch (error) {
-    console.error('Error fetching user bookings:', error.message);
-    return res.status(500).json({ error: 'Failed to fetch booked rides.' });
-  }
-});
-
-// --- 7. CANCEL A BOOKING ---
-router.post('/bookings/:bookingId/cancel', verifyToken, async (req, res) => {
+// --- 6. EDIT SCHEDULED RIDE (Allowed ONLY if status is 'scheduled' AND zero seats booked) ---
+router.patch('/:id', verifyToken, requireDriver, async (req, res) => {
+  const rideId = req.params.id;
+  const driverId = req.user.id;
   const client = await db.pool.connect();
-  try {
-    const { bookingId } = req.params;
-    const riderId = req.user.id;
 
+  try {
     await client.query('BEGIN');
 
-    const bookingRes = await client.query(
-      `SELECT * FROM bookings WHERE id = $1 AND rider_id = $2 FOR UPDATE`,
-      [bookingId, riderId]
-    );
+    const rideRes = await client.query(`SELECT * FROM rides WHERE id = $1 FOR UPDATE`, [rideId]);
 
-    if (bookingRes.rows.length === 0) {
+    if (rideRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Booking not found or unauthorized.' });
+      return res.status(404).json({ error: 'Ride not found.' });
     }
 
-    const booking = bookingRes.rows[0];
+    const ride = rideRes.rows[0];
 
-    if (booking.booking_status === 'cancelled') {
+    if (String(ride.driver_id) !== String(driverId)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Booking is already cancelled.' });
+      return res.status(403).json({ error: 'You are not authorized to edit this ride.' });
     }
 
-    await client.query(
-      `UPDATE rides 
-       SET seats_available = seats_available + $1 
-       WHERE id = $2`,
-      [booking.seats_booked, booking.ride_id]
-    );
-
-    await client.query(
-      `UPDATE bookings 
-       SET booking_status = 'cancelled' 
-       WHERE id = $1`,
-      [bookingId]
-    );
-
-    await client.query('COMMIT');
-    return res.status(200).json({ success: true, message: 'Booking cancelled.' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Cancellation error:', error.message);
-    return res.status(500).json({ error: 'Failed to cancel booking.' });
-  } finally {
-    client.release();
-  }
-});
-
-// --- 8. VERIFY OTP & START RIDE (Driver Side) ---
-router.post('/bookings/:bookingId/verify-start-otp', verifyToken, requireDriver, async (req, res) => {
-  const client = await db.pool.connect();
-  try {
-    const { bookingId } = req.params;
-    const { otp } = req.body;
-    const driverId = req.user.id;
-
-    if (!otp) {
-      return res.status(400).json({ error: 'Kripya 4-digit OTP enter karein.' });
+    if (String(ride.status).toLowerCase() !== 'scheduled') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Only scheduled rides can be edited. Current status: ${ride.status}.`,
+      });
     }
 
-    await client.query('BEGIN');
+    // Block editing if any seat is already booked
+    const bookingCheck = await client.query(
+      `SELECT COALESCE(SUM(seats_booked), 0)::int AS booked_seats,
+              COUNT(*)::int AS active_bookings
+       FROM bookings
+       WHERE ride_id = $1 AND booking_status = 'confirmed'`,
+      [rideId]
+    );
 
-    // Booking aur associated ride ki details fetch karein taaki driver verify ho sake
-    const queryText = `
-      SELECT 
-        b.id AS booking_id,
-        b.ride_otp,
-        b.booking_status,
-        b.is_otp_verified,
-        r.id AS ride_id,
-        r.driver_id,
-        r.status AS ride_status
-      FROM bookings b
-      JOIN rides r ON b.ride_id = r.id
-      WHERE b.id = $1 FOR UPDATE
+    const bookedSeats = bookingCheck.rows[0]?.booked_seats || 0;
+    const activeBookings = bookingCheck.rows[0]?.active_bookings || 0;
+
+    if (bookedSeats > 0 || activeBookings > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Cannot edit ride details once a seat has been booked.',
+      });
+    }
+
+    const {
+      origin,
+      start_location,
+      destination,
+      end_location,
+      departure_time,
+      seats_available,
+      total_seats,
+      price_per_seat,
+      distance_km,
+      toll_charges,
+      vehicle_type,
+      fuel_type,
+      vehicle_category,
+      luggage_size,
+      is_ac_available,
+      is_smoking_allowed,
+      is_pet_friendly,
+      gender_preference,
+      category_restriction,
+    } = req.body;
+
+    const nextOrigin = String(origin || start_location || ride.origin || '').trim();
+    const nextDestination = String(destination || end_location || ride.destination || '').trim();
+    const nextDeparture = departure_time || ride.departure_time;
+    const nextSeats =
+      seats_available !== undefined || total_seats !== undefined
+        ? parseInt(seats_available ?? total_seats, 10)
+        : parseInt(ride.seats_available, 10);
+    const nextPrice =
+      price_per_seat !== undefined ? parseFloat(price_per_seat) : parseFloat(ride.price_per_seat);
+
+    if (
+      !nextOrigin ||
+      !nextDestination ||
+      !nextDeparture ||
+      Number.isNaN(nextSeats) ||
+      nextSeats < 1 ||
+      Number.isNaN(nextPrice) ||
+      nextPrice < 0
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid ride details provided.' });
+    }
+
+    const nextDistance =
+      distance_km !== undefined ? parseFloat(distance_km) : parseFloat(ride.distance_km || 10);
+    const nextToll =
+      toll_charges !== undefined ? parseFloat(toll_charges) : parseFloat(ride.toll_charges || 0);
+    const nextVehicleType = vehicle_type || ride.vehicle_type || 'sedan';
+    const nextFuelType = fuel_type || ride.fuel_type || 'petrol';
+    const nextVehicleCategory = vehicle_category || ride.vehicle_category || 'car_5_seater';
+
+    const ceilingInfo = calculateLegalCeiling(
+      nextDistance,
+      nextSeats,
+      nextToll,
+      nextVehicleType,
+      nextVehicleCategory,
+      nextFuelType
+    );
+
+    if (nextPrice > ceilingInfo.maxAllowedPricePerSeat) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({
+        error: `Price ₹${nextPrice} exceeds legal cost-recovery ceiling (₹${ceilingInfo.maxAllowedPricePerSeat}).`,
+        max_allowed_price: ceilingInfo.maxAllowedPricePerSeat,
+      });
+    }
+
+    const updateQuery = `
+      UPDATE rides
+      SET origin = $1,
+          destination = $2,
+          departure_time = $3::timestamptz,
+          seats_available = $4,
+          price_per_seat = $5,
+          max_price_ceiling = $6,
+          toll_charges = $7,
+          distance_km = $8,
+          vehicle_type = $9,
+          fuel_type = $10,
+          vehicle_category = $11,
+          luggage_size = $12,
+          is_ac_available = $13,
+          is_smoking_allowed = $14,
+          is_pet_friendly = $15,
+          gender_preference = $16,
+          category_restriction = $17,
+          updated_at = NOW()
+      WHERE id = $18 AND driver_id = $19
+      RETURNING *;
     `;
 
-    const { rows } = await client.query(queryText, [bookingId]);
-
-    if (rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Booking nahi mili.' });
-    }
-
-    const booking = rows[0];
-
-    // Check karein ki request bhejne wala driver hi is ride ka owner hai
-    if (booking.driver_id !== driverId) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'Aap is ride ke driver nahi hain.' });
-    }
-
-    if (booking.booking_status !== 'confirmed') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Yeh booking active ya confirmed nahi hai.' });
-    }
-
-    if (booking.is_otp_verified) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Yeh OTP pehle hi verify ho chuka hai.' });
-    }
-
-    // OTP Match check
-    if (booking.ride_otp !== otp.toString().trim()) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Galat OTP enter kiya gaya hai. Passenger se dobara puchein.' });
-    }
-
-    // Booking ko verified mark karein aur ride status ko 'active' update karein
-    await client.query(
-      `UPDATE bookings SET is_otp_verified = TRUE, booking_status = 'ongoing' WHERE id = $1`,
-      [bookingId]
-    );
-
-    await client.query(
-      `UPDATE rides SET status = 'active' WHERE id = $1`,
-      [booking.ride_id]
-    );
+    const updated = await client.query(updateQuery, [
+      nextOrigin,
+      nextDestination,
+      nextDeparture,
+      nextSeats,
+      nextPrice,
+      ceilingInfo.maxAllowedPricePerSeat,
+      nextToll,
+      nextDistance,
+      nextVehicleType,
+      nextFuelType,
+      nextVehicleCategory,
+      luggage_size ?? ride.luggage_size ?? 'small',
+      is_ac_available ?? ride.is_ac_available ?? true,
+      is_smoking_allowed ?? ride.is_smoking_allowed ?? false,
+      is_pet_friendly ?? ride.is_pet_friendly ?? false,
+      gender_preference ?? ride.gender_preference ?? 'any',
+      category_restriction ?? ride.category_restriction ?? 'open',
+      rideId,
+      driverId,
+    ]);
 
     await client.query('COMMIT');
 
     return res.status(200).json({
       success: true,
-      message: 'OTP verified successfully! Trip shuru ho chuki hai.',
+      message: 'Ride details updated successfully.',
+      ride: updated.rows[0],
     });
-  } catch (error) {
+  } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Verify start OTP error:', error.message);
-    return res.status(500).json({ error: 'Server error during OTP verification' });
+    console.error('Edit ride error:', err.message);
+    return res.status(500).json({ error: 'Failed to update ride details.' });
   } finally {
     client.release();
   }
 });
-
-
-// router.post('/bookings/:bookingId/verify-start-otp', verifyToken, requireDriver, async (req, res) => {
-//   const client = await db.pool.connect();
-//   try {
-//     if (!req.body.otp) throw new Error('Kripya 4-digit OTP enter karein.');
-//     await client.query('BEGIN');
-    
-//     const { rows } = await client.query(`SELECT b.*, r.driver_id, r.status AS ride_status FROM bookings b JOIN rides r ON b.ride_id = r.id WHERE b.id = $1 FOR UPDATE`, [req.params.bookingId]);
-//     if (rows.length === 0) throw new Error('Booking nahi mili.');
-    
-//     const booking = rows[0];
-//     if (booking.driver_id !== req.user.id) throw new Error('Aap is ride ke driver nahi hain.');
-//     if (booking.booking_status !== 'confirmed' || booking.is_otp_verified) throw new Error('Invalid booking state ya OTP verified.');
-//     if (booking.ride_otp !== req.body.otp.toString().trim()) throw new Error('Galat OTP.');
-
-//     await client.query(`UPDATE bookings SET is_otp_verified = TRUE, booking_status = 'ongoing' WHERE id = $1`, [req.params.bookingId]);
-//     await client.query(`UPDATE rides SET status = 'in_progress' WHERE id = $1`, [booking.ride_id]);
-
-//     await client.query('COMMIT');
-//     return res.status(200).json({ success: true, message: 'OTP verified! Trip shuru ho chuki hai.' });
-//   } catch (error) {
-//     await client.query('ROLLBACK');
-//     return res.status(400).json({ error: error.message || 'Server error' });
-//   } finally {
-//     client.release();
-//   }
-// });
 
 module.exports = router;

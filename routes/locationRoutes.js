@@ -66,18 +66,35 @@ router.get('/areas/:city', async (req, res) => {
 // 5. Smart Search (By Area, City or PIN Code)
 router.get('/search', async (req, res) => {
   try {
-    const { query, city } = req.query;
-    if (!query) return res.json({ success: true, results: [] });
+    // Frontend se 'q' aayega, fallback ke liye 'query' rakha hai
+    const searchQuery = req.query.q || req.query.query; 
 
-    let sql = `SELECT * FROM locations_master WHERE (area_name ILIKE $1 OR city ILIKE $1 OR pincode ILIKE $1) AND is_active = TRUE`;
-    let params = [`%${query}%`];
-
-    if (city) {
-      sql += ` AND city = $2`;
-      params.push(city);
+    // Server load bachane ke liye kam se kam 3 characters zaroori hain
+    if (!searchQuery || searchQuery.trim().length < 3) {
+       return res.json({ success: true, results: [] }); 
     }
 
-    sql += ` LIMIT 15`;
+    // SQL query mein AS lagakar column names frontend ke hisab se set kiye hain
+    let sql = `
+      SELECT 
+        id, 
+        area_name AS area, 
+        city, 
+        state, 
+        country, 
+        pincode, 
+        latitude AS lat, 
+        longitude AS lng,
+        landmark_type,
+        city_tier
+      FROM locations_master 
+      WHERE (area_name ILIKE $1 OR city ILIKE $1 OR state ILIKE $1 OR pincode ILIKE $1) 
+        AND is_active = TRUE
+      LIMIT 15
+    `;
+    
+    let params = [`%${searchQuery.trim()}%`];
+    
     const result = await db.query(sql, params);
     res.json({ success: true, results: result.rows });
   } catch (err) {
@@ -122,6 +139,48 @@ router.get('/offers/:city', async (req, res) => {
   } catch (err) {
     console.error('Fetch offers error:', err);
     res.status(500).json({ error: 'Failed to fetch city offers' });
+  }
+});
+
+
+// 8. Auto-Save External/OSM Locations for Future & Admin Verification
+router.post('/save-external', async (req, res) => {
+  try {
+    const { area, city, state, country, pincode, lat, lng } = req.body;
+
+    if (!area || !city || !lat || !lng) {
+      return res.status(400).json({ error: 'Required fields missing' });
+    }
+
+    // Pehle check karein ki yeh exact coordinates (ya area) pehle se DB mein toh nahi hai
+    const checkDuplicate = await db.query(
+      `SELECT id FROM locations_master 
+       WHERE (latitude = $1 AND longitude = $2) OR (LOWER(area_name) = LOWER($3) AND LOWER(city) = LOWER($4))
+       LIMIT 1`,
+      [lat, lng, area, city]
+    );
+
+    if (checkDuplicate.rows.length > 0) {
+      return res.status(200).json({ success: true, message: 'Location already exists in DB' });
+    }
+
+    // Nayi location ko 'pending' status ke sath save karein
+    const insertQuery = `
+      INSERT INTO locations_master 
+        (area_name, city, state, country, pincode, latitude, longitude, is_active, source, approval_status, city_tier, landmark_type)
+      VALUES 
+        ($1, $2, $3, $4, $5, $6, $7, TRUE, 'osm_auto', 'pending', 'Tier-Unknown', 'Auto-Discovered')
+      RETURNING id
+    `;
+    
+    await db.query(insertQuery, [
+      area, city, state || '', country || 'India', pincode || '000000', lat, lng
+    ]);
+
+    return res.status(201).json({ success: true, message: 'New location cached for admin review' });
+  } catch (err) {
+    console.error('Auto-save location error:', err);
+    return res.status(500).json({ error: 'Failed to auto-save location' });
   }
 });
 

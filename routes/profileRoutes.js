@@ -5,6 +5,9 @@ const db = require('../config/db');
 const { verifyToken } = require('../middlewares/auth');
 const bcrypt = require('bcryptjs');
 
+const ALLOWED_LANGUAGES = new Set(['en', 'hi', 'hinglish']);
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 const getProfileHandler = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -12,7 +15,7 @@ const getProfileHandler = async (req, res) => {
     const userQuery = `
       SELECT 
         u.id, u.name, u.first_name, u.last_name, u.username,
-        u.email, u.phone, u.role, 
+        u.email, u.phone, u.role, u.preferred_language, u.is_biometric_enabled,
         COALESCE(
           (SELECT ROUND(AVG(rev.rating)::numeric, 1) FROM reviews rev WHERE rev.reviewed_user_id = u.id),
           5.0
@@ -25,7 +28,7 @@ const getProfileHandler = async (req, res) => {
     const userRes = await db.query(userQuery, [userId]);
 
     if (userRes.rows.length === 0) {
-      return res.status(404).json({ error: 'User nahi mila' });
+      return res.status(404).json({ success: false, error: 'User nahi mila' });
     }
 
     const user = userRes.rows[0];
@@ -33,7 +36,10 @@ const getProfileHandler = async (req, res) => {
     let completedRides = 0;
     try {
       const riderStatsRes = await db.query(
-        `SELECT COUNT(b.id) AS completed_rides FROM bookings b JOIN rides r ON b.ride_id = r.id WHERE b.rider_id = $1 AND b.booking_status = 'confirmed' AND r.status = 'completed'`,
+        `SELECT COUNT(b.id) AS completed_rides
+         FROM bookings b
+         JOIN rides r ON b.ride_id = r.id
+         WHERE b.rider_id = $1 AND b.booking_status = 'confirmed' AND r.status = 'completed'`,
         [userId]
       );
       completedRides = parseInt(riderStatsRes.rows[0]?.completed_rides || 0, 10);
@@ -68,7 +74,7 @@ const getProfileHandler = async (req, res) => {
     });
   } catch (error) {
     console.error('Profile fetch error:', error);
-    return res.status(500).json({ error: 'Profile fetch karne mein server error aaya' });
+    return res.status(500).json({ success: false, error: 'Profile fetch karne mein server error aaya' });
   }
 };
 
@@ -79,10 +85,12 @@ router.get('/me', verifyToken, getProfileHandler);
 router.get('/verification/my-status', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    
-    // Fetch user overall verification status
+
     const userRes = await db.query('SELECT verification_status FROM users WHERE id = $1', [userId]);
-    const docsRes = await db.query('SELECT * FROM user_documents WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+    const docsRes = await db.query(
+      'SELECT * FROM user_documents WHERE user_id = $1 ORDER BY created_at DESC',
+      [userId]
+    );
 
     return res.status(200).json({
       success: true,
@@ -91,7 +99,7 @@ router.get('/verification/my-status', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Verification status fetch error:', error);
-    return res.status(500).json({ error: 'Failed to fetch verification status' });
+    return res.status(500).json({ success: false, error: 'Failed to fetch verification status' });
   }
 });
 
@@ -102,19 +110,23 @@ router.post('/verification/submit-document', verifyToken, async (req, res) => {
     const { document_type, document_number, document_front_url, document_back_url } = req.body;
 
     if (!document_type || !document_number || !document_front_url) {
-      return res.status(400).json({ error: 'Document type, number aur front image anivarya hain.' });
+      return res.status(400).json({
+        success: false,
+        error: 'Document type, number aur front image anivarya hain.',
+      });
     }
 
-    const maskedNum = '****' + document_number.slice(-4);
+    const cleanDocNum = String(document_number).trim();
+    const maskedNum = '****' + cleanDocNum.slice(-4);
 
-    // Insert into separate user_documents table
     await db.query(
-      `INSERT INTO user_documents (user_id, document_type, document_number_masked, document_front_url, document_back_url, status)
-       VALUES ($1, $2, $3, $4, $5, 'pending')`,
+      `INSERT INTO user_documents (
+        user_id, document_type, document_number_masked, document_front_url, document_back_url, status
+      )
+      VALUES ($1, $2, $3, $4, $5, 'pending')`,
       [userId, document_type, maskedNum, document_front_url, document_back_url || null]
     );
 
-    // Update user status to pending review
     await db.query(
       `UPDATE users SET verification_status = 'pending', updated_at = NOW() WHERE id = $1`,
       [userId]
@@ -126,31 +138,38 @@ router.post('/verification/submit-document', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Document submission error:', error);
-    return res.status(500).json({ error: 'Server error during document submission.' });
+    return res.status(500).json({ success: false, error: 'Server error during document submission.' });
   }
 });
 
-// Switch User Active Role
+// --- 3. SWITCH USER ACTIVE ROLE ---
 router.patch('/switch-mode', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { mode } = req.body;
 
     if (!['rider', 'driver'].includes(mode)) {
-      return res.status(400).json({ error: 'Mode keval rider ya driver ho sakta hai' });
+      return res.status(400).json({
+        success: false,
+        error: 'Mode keval rider ya driver ho sakta hai',
+      });
     }
 
     if (mode === 'driver') {
-      const check = await db.query(`SELECT is_verified, verification_status FROM users WHERE id = $1`, [userId]);
+      const check = await db.query(
+        `SELECT is_verified, verification_status FROM users WHERE id = $1`,
+        [userId]
+      );
       if (!check.rows[0]?.is_verified) {
         return res.status(403).json({
+          success: false,
           error: 'Driver Mode activate karne ke liye pehle apna Driving License verify karein.',
           verification_status: check.rows[0]?.verification_status || 'unverified',
         });
       }
     }
 
-    await db.query(`UPDATE users SET role = $1 WHERE id = $2`, [mode, userId]);
+    await db.query(`UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2`, [mode, userId]);
 
     return res.status(200).json({
       success: true,
@@ -159,146 +178,264 @@ router.patch('/switch-mode', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Mode switch error:', error);
-    return res.status(500).json({ error: 'Mode switch karte waqt error aaya' });
+    return res.status(500).json({ success: false, error: 'Mode switch karte waqt error aaya' });
   }
 });
 
-// --- CHANGE PASSWORD ---
+// --- 4. CHANGE PASSWORD ---
 router.post('/change-password', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { currentPassword, newPassword } = req.body;
+
     if (!currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'Current aur new password dono anivarya hain.' });
+      return res.status(400).json({
+        success: false,
+        error: 'Current aur new password dono anivarya hain.',
+      });
     }
 
-    const userRes = await db.query('SELECT password_hash, password FROM users WHERE id = $1', [userId]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User nahi mila.' });
+    if (String(newPassword).length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'New password kam se kam 8 characters ka hona chahiye.',
+      });
+    }
+
+    const userRes = await db.query(
+      'SELECT password_hash, password FROM users WHERE id = $1',
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User nahi mila.' });
+    }
 
     const user = userRes.rows[0];
     const storedHash = user.password_hash || user.password;
-    let passwordMatches = storedHash.startsWith('$2a$') || storedHash.startsWith('$2b$') 
-      ? await bcrypt.compare(currentPassword, storedHash) 
-      : (currentPassword === storedHash);
+    const passwordMatches =
+      storedHash && (storedHash.startsWith('$2a$') || storedHash.startsWith('$2b$'))
+        ? await bcrypt.compare(currentPassword, storedHash)
+        : currentPassword === storedHash;
 
-    if (!passwordMatches) return res.status(400).json({ error: 'Aapka current password galat hai.' });
+    if (!passwordMatches) {
+      return res.status(400).json({ success: false, error: 'Aapka current password galat hai.' });
+    }
 
     const newHashedPassword = await bcrypt.hash(newPassword, 10);
-    await db.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHashedPassword, userId]);
+    await db.query(
+      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [newHashedPassword, userId]
+    );
 
     return res.status(200).json({ success: true, message: 'Password safalta se update ho gaya!' });
   } catch (error) {
     console.error('Change password error:', error);
-    return res.status(500).json({ error: 'Password change karte waqt server error aaya.' });
+    return res.status(500).json({ success: false, error: 'Password change karte waqt server error aaya.' });
   }
 });
 
-// --- UPDATE MPIN ---
+// --- 5. UPDATE MPIN ---
 router.post('/update-mpin', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { mpin } = req.body;
-    if (!mpin || mpin.length !== 6) return res.status(400).json({ error: 'MPIN theek 6 digits ka hona chahiye.' });
+    const cleanMpin = String(req.body?.mpin || '').trim();
 
-    const hashedMpin = await bcrypt.hash(mpin.trim(), 10);
-    await db.query('UPDATE users SET mpin_hash = $1, updated_at = NOW() WHERE id = $2', [hashedMpin, userId]);
+    if (!/^\d{6}$/.test(cleanMpin)) {
+      return res.status(400).json({
+        success: false,
+        error: 'MPIN theek 6 digits ka hona chahiye.',
+      });
+    }
+
+    const hashedMpin = await bcrypt.hash(cleanMpin, 10);
+    await db.query(
+      'UPDATE users SET mpin_hash = $1, updated_at = NOW() WHERE id = $2',
+      [hashedMpin, userId]
+    );
 
     return res.status(200).json({ success: true, message: 'MPIN safalta se set ho gaya!' });
   } catch (error) {
     console.error('Update MPIN error:', error);
-    return res.status(500).json({ error: 'MPIN update karte waqt server error aaya.' });
+    return res.status(500).json({ success: false, error: 'MPIN update karte waqt server error aaya.' });
   }
 });
 
-// --- UPDATE BIOMETRIC SECURITY ---
+// --- 6. UPDATE BIOMETRIC SECURITY ---
 router.post('/update-security', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { is_biometric_enabled } = req.body;
-    if (typeof is_biometric_enabled !== 'boolean') return res.status(400).json({ error: 'Invalid preference.' });
 
-    await db.query('UPDATE users SET is_biometric_enabled = $1, updated_at = NOW() WHERE id = $2', [is_biometric_enabled, userId]);
+    if (typeof is_biometric_enabled !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'Invalid preference.' });
+    }
+
+    await db.query(
+      'UPDATE users SET is_biometric_enabled = $1, updated_at = NOW() WHERE id = $2',
+      [is_biometric_enabled, userId]
+    );
+
     return res.status(200).json({ success: true, message: 'Biometric setting update ho gayi!' });
   } catch (error) {
     console.error('Update security error:', error);
-    return res.status(500).json({ error: 'Server error.' });
+    return res.status(500).json({ success: false, error: 'Server error.' });
   }
 });
 
-// --- VEHICLE & EMERGENCY & SAVED LOCATIONS ENDPOINTS ---
-router.get('/vehicle/:userId', async (req, res) => {
-  const result = await db.query('SELECT * FROM vehicles WHERE driver_id = $1', [req.params.userId]);
-  res.json({ success: true, vehicle: result.rows[0] || null });
-});
-
-router.post('/vehicle', async (req, res) => {
-  const { driver_id, vehicle_model, vehicle_number, color, capacity } = req.body;
-  const result = await db.query(
-    `INSERT INTO vehicles (driver_id, vehicle_model, vehicle_number, color, capacity) VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (vehicle_number) DO UPDATE SET vehicle_model = $2, color = $4, capacity = $5 RETURNING *`,
-    [driver_id, vehicle_model, vehicle_number, color, capacity || 3]
-  );
-  res.json({ success: true, vehicle: result.rows[0] });
-});
-
-router.get('/emergency-contacts/:userId', async (req, res) => {
-  const result = await db.query('SELECT * FROM emergency_contacts WHERE user_id = $1', [req.params.userId]);
-  res.json({ success: true, contacts: result.rows });
-});
-
-router.post('/emergency-contacts', async (req, res) => {
-  const { user_id, contact_name, phone_number, relation } = req.body;
-  const result = await db.query(
-    `INSERT INTO emergency_contacts (user_id, contact_name, phone_number, relation) VALUES ($1, $2, $3, $4) RETURNING *`,
-    [user_id, contact_name, phone_number, relation || 'Family']
-  );
-  res.json({ success: true, contact: result.rows[0] });
-});
-
-router.delete('/emergency-contacts/:contactId', async (req, res) => {
-  await db.query('DELETE FROM emergency_contacts WHERE id = $1', [req.params.contactId]);
-  res.json({ success: true });
-});
-
-router.get('/saved-locations/:userId', async (req, res) => {
-  const result = await db.query('SELECT * FROM saved_locations WHERE user_id = $1', [req.params.userId]);
-  res.json({ success: true, locations: result.rows });
-});
-
-router.post('/saved-locations', async (req, res) => {
-  const { user_id, title, address, latitude, longitude } = req.body;
-  const result = await db.query(
-    `INSERT INTO saved_locations (user_id, title, address, latitude, longitude) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [user_id, title, address, latitude, longitude]
-  );
-  res.json({ success: true, location: result.rows[0] });
-});
-
-router.delete('/saved-locations/:locationId', async (req, res) => {
-  await db.query('DELETE FROM saved_locations WHERE id = $1', [req.params.locationId]);
-  res.json({ success: true });
-});
-
-
-// --- UPDATE LANGUAGE PREFERENCE ---
+// --- 7. UPDATE LANGUAGE PREFERENCE ('en' | 'hi' | 'hinglish') ---
 router.post('/update-language', verifyToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { preferred_language } = req.body;
+    const preferredLanguage = String(req.body?.preferred_language || '')
+      .toLowerCase()
+      .trim();
 
-    if (!['en', 'hi', 'hinglish'].includes(preferred_language)) {
-      return res.status(400).json({ error: 'Invalid language selection.' });
+    if (!ALLOWED_LANGUAGES.has(preferredLanguage)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid language selection. Allowed: en, hi, hinglish.',
+      });
     }
 
     await db.query(
       'UPDATE users SET preferred_language = $1, updated_at = NOW() WHERE id = $2',
-      [preferred_language, userId]
+      [preferredLanguage, userId]
     );
 
-    res.json({ success: true, message: 'Language preference updated successfully!' });
+    return res.status(200).json({
+      success: true,
+      message: 'Language preference updated successfully!',
+      preferred_language: preferredLanguage,
+    });
   } catch (err) {
     console.error('Language update error:', err);
-    res.status(500).json({ error: 'Server error updating language' });
+    return res.status(500).json({ success: false, error: 'Server error updating language' });
+  }
+});
+
+// --- 8. VEHICLE, EMERGENCY CONTACTS & SAVED LOCATIONS ---
+router.get('/vehicle/:userId', verifyToken, async (req, res) => {
+  try {
+    if (!UUID_REGEX.test(req.params.userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid user ID' });
+    }
+    const result = await db.query('SELECT * FROM vehicles WHERE driver_id = $1', [req.params.userId]);
+    return res.json({ success: true, vehicle: result.rows[0] || null });
+  } catch (err) {
+    console.error('Fetch vehicle error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.post('/vehicle', verifyToken, async (req, res) => {
+  try {
+    const driverId = req.user.id;
+    const { vehicle_model, vehicle_number, color, capacity } = req.body;
+    const result = await db.query(
+      `INSERT INTO vehicles (driver_id, vehicle_model, vehicle_number, color, capacity)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (vehicle_number) DO UPDATE SET vehicle_model = $2, color = $4, capacity = $5
+       RETURNING *`,
+      [driverId, vehicle_model, vehicle_number, color, capacity || 3]
+    );
+    return res.json({ success: true, vehicle: result.rows[0] });
+  } catch (err) {
+    console.error('Save vehicle error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.get('/emergency-contacts/:userId', verifyToken, async (req, res) => {
+  try {
+    if (!UUID_REGEX.test(req.params.userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid user ID' });
+    }
+    const result = await db.query('SELECT * FROM emergency_contacts WHERE user_id = $1', [
+      req.params.userId,
+    ]);
+    return res.json({ success: true, contacts: result.rows });
+  } catch (err) {
+    console.error('Fetch emergency contacts error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.post('/emergency-contacts', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { contact_name, phone_number, relation } = req.body;
+    const result = await db.query(
+      `INSERT INTO emergency_contacts (user_id, contact_name, phone_number, relation)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, contact_name, phone_number, relation || 'Family']
+    );
+    return res.json({ success: true, contact: result.rows[0] });
+  } catch (err) {
+    console.error('Add emergency contact error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.delete('/emergency-contacts/:contactId', verifyToken, async (req, res) => {
+  try {
+    if (!UUID_REGEX.test(req.params.contactId)) {
+      return res.status(400).json({ success: false, error: 'Invalid contact ID' });
+    }
+    await db.query('DELETE FROM emergency_contacts WHERE id = $1 AND user_id = $2', [
+      req.params.contactId,
+      req.user.id,
+    ]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Delete emergency contact error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.get('/saved-locations/:userId', verifyToken, async (req, res) => {
+  try {
+    if (!UUID_REGEX.test(req.params.userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid user ID' });
+    }
+    const result = await db.query('SELECT * FROM saved_locations WHERE user_id = $1', [
+      req.params.userId,
+    ]);
+    return res.json({ success: true, locations: result.rows });
+  } catch (err) {
+    console.error('Fetch saved locations error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.post('/saved-locations', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { title, address, latitude, longitude } = req.body;
+    const result = await db.query(
+      `INSERT INTO saved_locations (user_id, title, address, latitude, longitude)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [userId, title, address, latitude, longitude]
+    );
+    return res.json({ success: true, location: result.rows[0] });
+  } catch (err) {
+    console.error('Save location error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+router.delete('/saved-locations/:locationId', verifyToken, async (req, res) => {
+  try {
+    if (!UUID_REGEX.test(req.params.locationId)) {
+      return res.status(400).json({ success: false, error: 'Invalid location ID' });
+    }
+    await db.query('DELETE FROM saved_locations WHERE id = $1 AND user_id = $2', [
+      req.params.locationId,
+      req.user.id,
+    ]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Delete saved location error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
