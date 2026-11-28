@@ -8,8 +8,22 @@ if (process.env.NODE_ENV === 'test') {
   require('dotenv').config();
 }
 
+function getCleanConnectionString(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.searchParams.delete('sslmode');
+    parsed.searchParams.delete('sslcert');
+    parsed.searchParams.delete('sslkey');
+    parsed.searchParams.delete('sslrootcert');
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: getCleanConnectionString(process.env.DATABASE_URL),
   ssl: { rejectUnauthorized: false, },
   max: 20,
   idleTimeoutMillis: 30000,
