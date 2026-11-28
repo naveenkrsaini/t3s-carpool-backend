@@ -37,6 +37,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 
 // 1. Initialize Express and HTTP Server
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // 2. Socket.io Setup
